@@ -25,6 +25,20 @@ assert.ok(html.includes('重新分析素材'));
 assert.ok(html.includes('id="asset-form"'), 'Ready projects without segments can add references.');
 assert.match(run('strategyOptions()'), /value="keyframe"[^>]*disabled/, 'Missing image model disables keyframe selection.');
 
+// Analysis retries keep a separate explicit action for a new, billable analysis.
+run(`globalThis.originalProject=structuredClone(state.project);state.project={id:'p',name:'Product',status:'failed',options:{},assets:[{id:'r',role:'reference'},{id:'p',role:'product'},{id:'raw',role:'analysis_raw',name:'reply.json',mime:'application/json',size:100},{id:'repair',role:'analysis_repair',name:'repair.json',mime:'application/json',size:100}],segments:[],jobs:[],analysis:null,error:'第 1 个镜头的约束格式有误'};`);
+html = run('projectPage()');
+assert.ok(html.includes('data-action="retry-project"'), 'Failed analysis must allow continuing the saved result.');
+assert.ok(html.includes('class="button small ghost" data-action="analyze-project">重新分析素材'), 'Starting fresh must have a distinct small action.');
+assert.ok(html.includes('本地格式修复不调用模型')&&html.includes('最多调用一次文本格式修复'), 'Analysis recovery must explain its limited model calls.');
+assert.ok(html.includes('重新分析素材会重新调用模型，产生分析费用'), 'Starting fresh must explain the analysis fee.');
+assert.ok(html.includes('分析原始结果')&&html.includes('分析格式修复结果'), 'Saved response roles need understandable labels.');
+assert.ok(html.includes('/api/assets/raw')&&html.includes('/api/assets/repair'), 'Saved model replies remain available through the asset list.');
+run(`state.project.status='analyzing';state.project.jobs=[{status:'running'}]`);
+html = run('projectPage()');
+assert.ok(!html.includes('>重新分析素材</button>'), 'A running analysis must not offer a fresh conflicting analysis.');
+run(`state.project=originalProject;delete globalThis.originalProject`);
+
 run(`state.project.status='needs_review';state.project.output_asset_id='output';state.project.analysis.segments[0].start=10;state.project.segments=[{id:'s',index:0,asset_id:'current',status:'succeeded',attempts:1,quality:{status:'issues',summary:'Mismatch',sampled_times:[2],issues:[{time:2,category:'mixed_identity',severity:'error',description:'Wrong parts',suggestion:'Replace'}]},history:[{asset_id:'old',attempts:1,quality:{status:'uncertain',summary:'Old'}}]}];`);
 html = run('projectPage()');
 assert.ok(html.includes('下载待审核成片'), 'Flagged outputs remain downloadable and explicitly unapproved.');

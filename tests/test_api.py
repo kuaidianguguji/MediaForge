@@ -602,6 +602,34 @@ def test_ready_project_can_explicitly_reanalyze_but_invalid_request_preserves_pl
     assert detail["analysis"] is None and detail["status"] == "analyzing"
 
 
+def test_fresh_analysis_invalidates_receipts_atomically_and_retry_preserves_them(api_client):
+    bootstrap(api_client)
+    headers = login(api_client)
+    project = create_project(api_client, headers)
+    with SessionLocal() as db:
+        row = db.get(Project, project["id"])
+        row.status = "failed"
+        receipt = add_asset(db, row, b'{"text":"original analysis"}', "analysis.json", "application/json", "analysis_raw", {"fingerprint": "test", "superseded": False})
+        db.commit()
+        receipt_id = receipt.id
+    route = f"/api/projects/{project['id']}"
+    assert api_client.post(route + "/analyze", headers=headers).status_code == 422
+    with SessionLocal() as db:
+        assert not db.get(Asset, receipt_id).meta["superseded"]
+    seed_asset(project["id"])
+    seed_asset(project["id"], role="product", data=png(), name="original.png", mime="image/png")
+    assert api_client.post(route + "/retry", headers=headers).status_code == 200
+    with SessionLocal() as db:
+        assert not db.get(Asset, receipt_id).meta["superseded"]
+        db.get(Project, project["id"]).status = "failed"
+        db.scalar(select(Job).where(Job.project_id == project["id"])).status = "failed"
+        db.commit()
+    assert api_client.post(route + "/analyze", headers=headers).status_code == 200
+    with SessionLocal() as db:
+        assert db.get(Asset, receipt_id).meta["superseded"]
+        assert db.get(Asset, receipt_id).data == b'{"text":"original analysis"}'
+
+
 def test_quality_migration_backfills_existing_segments(tmp_path):
     import importlib.util
     import sqlalchemy as sa

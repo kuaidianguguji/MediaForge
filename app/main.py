@@ -20,7 +20,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from . import config, media
+from . import analysis_results, config, media
 from .db import Asset, Audit, Job, ModelConfig, Project, Segment, SessionLocal, SessionToken, Setting, User, get_db
 from .schemas import AnalysisPlan, AudioOptionsInput, LoginInput, ModelInput, PlanInput, ProjectInput, SegmentRepairInput, SetupInput, StorageInput, UserInput, UserPatch
 from .security import admin_user, current_user, encrypt, hash_password, local_secret, token_hash, verify_password
@@ -407,6 +407,7 @@ def analyze_project(project_id: str, user: User = Depends(current_user), db: Ses
         if project.status not in {"draft", "ready", "failed", "needs_attention"} or db.scalar(select(Segment.id).where(Segment.project_id == project.id)):
             raise HTTPException(409, "当前项目不能重新分析")
         result = queue_job(db, project, "analyze", user, commit=False)
+        analysis_results.invalidate_replies(db, project.id)
         project.analysis = None
         db.commit()
         return result

@@ -138,7 +138,13 @@ def _json_object(text):
         raise ProviderError("分析模型没有返回有效 JSON 对象，请更换支持结构化分析的模型。") from None
 
 
-def analyze(model, prompt: str, images: list[bytes]) -> dict:
+def analyze(model, prompt: str, images: list[bytes], on_response=None) -> dict:
+    """Capture assistant text before parsing, so a failed analysis can be recovered.
+
+    ``on_response(text, metadata)`` receives only assistant text and completion
+    metadata, never request headers, credentials or the full HTTP response.
+    Capture errors propagate: callers must not continue with an unsaved result.
+    """
     if model.protocol not in {"openai", "anthropic", "volcengine"}:
         raise ProviderError("不支持此视觉分析协议。")
     if any(len(image) > MAX_IMAGE_BYTES for image in images):
@@ -150,10 +156,15 @@ def analyze(model, prompt: str, images: list[bytes]) -> dict:
         content.append({"type": "text", "text": instruction})
         result = _request(model, "POST", "messages", json={"model": model.model_id,
             "max_tokens": 8192, "messages": [{"role": "user", "content": content}]})
-        if result.get("stop_reason") == "max_tokens":
-            raise ProviderError("分析结果超过模型输出限制，请减少输入视频长度或选择其他模型。")
+        finish_reason = result.get("stop_reason")
         blocks = result.get("content", [])
-        text = "\n".join(x.get("text", "") for x in blocks if isinstance(x, dict) and x.get("type") == "text")
+        if not isinstance(blocks, list):
+            raise ProviderError("视觉模型响应缺少分析内容。")
+        texts = [x.get("text", "") for x in blocks
+                 if isinstance(x, dict) and x.get("type") == "text"]
+        if not all(isinstance(value, str) for value in texts):
+            raise ProviderError("分析模型未返回有效文本。")
+        text = "\n".join(texts)
     else:
         content = [{"type": "text", "text": instruction}]
         content.extend({"type": "image_url", "image_url": {"url":
@@ -162,11 +173,25 @@ def analyze(model, prompt: str, images: list[bytes]) -> dict:
             "messages": [{"role": "user", "content": content}]})
         try:
             choice = result["choices"][0]
-            if choice.get("finish_reason") == "length":
-                raise ProviderError("分析输出被截断，请减少视频长度或更换模型。")
+            finish_reason = choice.get("finish_reason")
             text = choice["message"]["content"]
-        except (KeyError, IndexError, TypeError):
+        except (KeyError, IndexError, TypeError, AttributeError):
             raise ProviderError("视觉模型响应缺少分析内容。") from None
+    if not isinstance(text, str):
+        raise ProviderError("分析模型未返回有效文本。")
+    truncated = finish_reason in {"max_tokens", "length"} if isinstance(finish_reason, str) else False
+    if on_response is not None:
+        # Finish reasons are provider metadata, not trusted user-facing text.
+        safe_reason = finish_reason if isinstance(finish_reason, str) and finish_reason in {
+            "stop", "length", "content_filter", "tool_calls", "function_call",
+            "end_turn", "max_tokens", "stop_sequence", "tool_use", "pause_turn", "refusal"
+        } else "unknown" if finish_reason is not None else None
+        on_response(text, {"finish_reason": safe_reason, "truncated": truncated})
+    if truncated:
+        message = ("分析结果超过模型输出限制，请减少输入视频长度或选择其他模型。"
+                   if model.protocol == "anthropic" else
+                   "分析输出被截断，请减少视频长度或更换模型。")
+        raise ProviderError(message)
     return _json_object(text)
 
 

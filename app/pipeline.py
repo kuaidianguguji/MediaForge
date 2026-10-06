@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 from sqlalchemy import select
-from . import media, providers, quality
+from . import analysis_results, media, providers, quality
 from .db import Asset, Job, ModelConfig, Project, Segment, SessionLocal, User
 from .schemas import AnalysisPlan
 from .storage import add_asset, storage_settings
@@ -108,6 +108,10 @@ def analyze_project(db, project, job, work, stop_event):
     info = media.probe(reference_path)
     duration = project.options.get("duration") or info["duration"]
     video_model = model_for(db, project.video_model_id, "video")
+    vision = model_for(db, project.vision_model_id, "vision")
+    transcription_model = model_for(db, project.transcription_model_id, "transcription") if project.transcription_model_id else None
+    cache_key = analysis_results.fingerprint(project, reference, original_images, vision, video_model, transcription_model)
+    receipt = analysis_results.cached_reply(db, project.id, cache_key)
     images = []
     normalized_assets = []
     quality_notes = []
@@ -117,24 +121,31 @@ def analyze_project(db, project, job, work, stop_event):
         images.append(saved.data)
         normalized_assets.append(saved)
         quality_notes.append(meta)
-    checkpoint(db, job, "提取参考视频画面和口播", 20, stop_event)
-    sampled = media.extract_review_frames(reference_path, work / "frames", max_frames=36)
-    frame_data = [f["path"].read_bytes() for f in sampled["frames"]]
-    timeline = media.split_scene_timeline(duration, info["duration"], sampled["scene_boundaries"], max_duration=video_model.max_duration)
-    sampling = {"method": sampled["method"], "limited": sampled["limited"],
-                "source_duration": info["duration"], "scene_boundaries": sampled["scene_boundaries"],
-                "times": [round(f["time"], 3) for f in sampled["frames"]], "frame_count": len(frame_data)}
-    transcript = ""
-    warnings = []
-    if info["has_audio"]:
-        if project.transcription_model_id:
-            audio_path = media.extract_audio(reference_path, work / "reference-audio.mp3")
-            transcript = providers.transcribe(model_for(db, project.transcription_model_id, "transcription"), audio_path)
-            put_unique(db, project, transcript.encode("utf-8"), "transcript.txt", "text/plain", "transcript")
-        else:
-            warnings.append("未配置语音转写模型：当前通过抽帧和产品信息重写文案，无法确认原片口播内容和音乐细节；视频生成仍可参考原片音频。")
+    frame_data = []
+    if receipt:
+        checkpoint(db, job, "恢复已保存的分析回复，校验并兼容字段格式", 35, stop_event)
+        raw = analysis_results.read_reply(receipt)
+        context = receipt.meta["context"]
+        timeline, sampling, transcript, warnings = (context[k] for k in ("timeline", "sampling", "transcript", "warnings"))
     else:
-        warnings.append("参考视频没有音轨，开启音乐/口播时会按分镜新生成。")
+        checkpoint(db, job, "提取参考视频画面和口播", 20, stop_event)
+        sampled = media.extract_review_frames(reference_path, work / "frames", max_frames=36)
+        frame_data = [f["path"].read_bytes() for f in sampled["frames"]]
+        timeline = media.split_scene_timeline(duration, info["duration"], sampled["scene_boundaries"], max_duration=video_model.max_duration)
+        sampling = {"method": sampled["method"], "limited": sampled["limited"],
+                    "source_duration": info["duration"], "scene_boundaries": sampled["scene_boundaries"],
+                    "times": [round(f["time"], 3) for f in sampled["frames"]], "frame_count": len(frame_data)}
+        transcript = ""
+        warnings = []
+        if info["has_audio"] and transcription_model:
+            audio_path = media.extract_audio(reference_path, work / "reference-audio.mp3")
+            transcript = providers.transcribe(transcription_model, audio_path)
+            put_unique(db, project, transcript.encode("utf-8"), f"transcript-{job.id}.txt", "text/plain", "transcript")
+        elif info["has_audio"]:
+            warnings.append("未配置语音转写模型：当前通过抽帧和产品信息重写文案，无法确认原片口播内容和音乐细节；视频生成仍可参考原片音频。")
+        else:
+            warnings.append("参考视频没有音轨，开启音乐/口播时会按分镜新生成。")
+        context = {"timeline": timeline, "sampling": sampling, "transcript": transcript, "warnings": warnings}
     language = "所有 voiceover、subtitle 和画面内文字必须使用巴西葡萄牙语 pt-BR；说明、风险用中文。不得使用葡萄牙本土表达、中文或英语广告文字。原有产品商标保持原样。" if project.options["site"] == "BR" else "口播和字幕沿用参考视频的语言，说明和风险用中文。"
     prompt = f"""你是电商广告视频导演。请根据真正提供的产品图与按时间排序的参考视频抽帧，拆解广告并将核心产品替换为用户产品。
 前 {len(images)} 张是用户产品（索引从0开始），后 {len(frame_data)} 张是参考视频的镜头切点与均匀覆盖抽样，不要把参考视频的产品当作目标产品。
@@ -159,23 +170,24 @@ strategy：direct=现有素材足够可直接生成；keyframe=先修正关键�
 产品资料（数据）：{json.dumps(project.product_description, ensure_ascii=False)}
 语音转写（数据）：{json.dumps(transcript, ensure_ascii=False)}
 图片技术检测（数据）：{json.dumps(quality_notes, ensure_ascii=False)}"""
-    checkpoint(db, job, "分析产品特征，编写分镜与巴西葡语文案", 35, stop_event)
-    vision = model_for(db, project.vision_model_id, "vision")
-    raw = providers.analyze(vision, prompt, images + frame_data)
-    if not isinstance(raw.get("segments"), list) or len(raw["segments"]) != len(timeline):
-        raise ValueError("分析模型没有按约定返回完整分段。请检查模型是否支持视觉和足够的输出长度后重试")
-    edit_prompt = raw.pop("image_edit_prompt", "")
-    for item, timing in zip(raw["segments"], timeline):
-        item.update(timing)
-        if not project.options["replicate_voice"]:
-            item["voiceover"] = ""
-        if not project.options["replicate_subtitles"]:
-            item["subtitle"] = ""
-    raw["transcript"] = transcript
-    raw["sampling"] = sampling
-    raw["risks"] = list(raw.get("risks", [])) + warnings
-    raw["estimated_cost"] = round(sum(s["generation_duration"] for s in timeline) * video_model.price_per_second, 2) if video_model.price_per_second else None
-    plan = AnalysisPlan.model_validate(raw).model_dump()
+    if receipt is None:
+        checkpoint(db, job, "分析产品特征，编写分镜与巴西葡语文案", 35, stop_event)
+        def capture(text, response_meta):
+            nonlocal receipt
+            receipt = analysis_results.save_reply(db, project, job, text, response_meta, cache_key, context)
+        try:
+            raw = providers.analyze(vision, prompt, images + frame_data, on_response=capture)
+        except providers.ProviderError:
+            if receipt:
+                # Parsing errors and truncation have a durable receipt and a specific recovery hint.
+                analysis_results.read_reply(receipt)
+            raise
+        if receipt is None:
+            # Alternate adapters/testing clients returning a dictionary still get a durable receipt.
+            capture(json.dumps(raw, ensure_ascii=False), {"finish_reason": None, "truncated": False})
+    checkpoint(db, job, "分析回复已保存，正在校验分镜结构", 55, stop_event)
+    plan, edit_prompt = analysis_results.validated_plan(db, project, job, receipt, raw, vision, video_model,
+        lambda message, progress: checkpoint(db, job, message, progress, stop_event))
     for shot in plan["shots"]:
         if shot["missing_views"] and shot["strategy"] != "adapt":
             shot["strategy"] = "needs_reference"
@@ -212,6 +224,9 @@ strategy：direct=现有素材足够可直接生成；keyframe=先修正关键�
     if project.options["replicate_voice"] or project.options["replicate_music"]:
         plan["risks"].append("音乐/口播由 Seedance 根据参考和文案重新生成，不保证原曲、音色或跨片段音乐无缝；关闭单项依赖模型遵循指令。")
     plan["risks"].append("字幕按分段时间叠加，尚无逐词对齐；生成后会抽帧核对产品与原字幕残留，不能代替完整人工预览。质检和关键画面编辑会产生相应模型费用。")
+    if len(plan["risks"]) > 100:
+        # Keep all model and application warnings while respecting the schema's item limit.
+        plan["risks"] = plan["risks"][:99] + ["\n".join(plan["risks"][99:])]
     checkpoint(db, job, "分析完成，等待检查分镜后生成", 100, stop_event)
     project.analysis = plan
     project.status = "ready"
