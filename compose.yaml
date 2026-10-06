@@ -1,0 +1,10 @@
+services:
+  videoimageoperation:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - vio-data:/app/data
+    restart: unless-stopped
+volumes:
+  vio-data:
