@@ -1,4 +1,6 @@
 import math
+import re
+from datetime import date
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -21,7 +23,7 @@ class UserPatch(BaseModel):
 class ModelInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     kind: Literal["vision", "image", "video", "transcription"]
-    protocol: Literal["openai", "anthropic", "volcengine"]
+    protocol: Literal["openai", "anthropic", "volcengine", "dashscope", "dashscope_asr"]
     base_url: str = Field(max_length=1000)
     model_id: str = Field(min_length=1, max_length=200)
     api_key: str = Field(default="", max_length=4096)
@@ -39,13 +41,40 @@ class ModelInput(BaseModel):
 
     @model_validator(mode="after")
     def compatible(self):
-        if self.kind == "video" and self.protocol != "volcengine":
-            raise ValueError("Seedance 视频需选择火山方舟协议；中转站必须兼容其任务 API")
+        if self.kind == "video" and self.protocol not in {"volcengine", "dashscope"}:
+            raise ValueError("视频生成需选择火山引擎或阿里云百炼协议；OpenAI Chat 兼容不代表视频接口兼容")
+        if self.protocol == "dashscope":
+            if self.kind != "video":
+                raise ValueError("阿里云百炼协议目前用于万相视频生成，请将模型用途设为视频生成")
+            if self.model_id not in {"wan3.0-video", "wan3.0-video-prime"}:
+                raise ValueError("万相视频模型 ID 请填写 wan3.0-video 或 wan3.0-video-prime")
+            if urlsplit(self.base_url).path.rstrip("/") != "/api/v1":
+                raise ValueError("阿里云百炼视频 Base URL 应以 /api/v1 结尾，不包含具体操作路径或 compatible-mode")
+        if self.protocol == "dashscope_asr":
+            if self.kind != "transcription":
+                raise ValueError("阿里云音频转写协议仅用于音频转写模型")
+            if not re.fullmatch(r"qwen3-asr-flash-filetrans(?:-\d{4}-\d{2}-\d{2})?", self.model_id):
+                raise ValueError("阿里云音频转写目前支持 qwen3-asr-flash-filetrans 及其日期快照版；普通 flash 聊天接口不提供逐词时间戳")
+            if self.model_id != "qwen3-asr-flash-filetrans":
+                try:
+                    date.fromisoformat(self.model_id[-10:])
+                except ValueError:
+                    raise ValueError("阿里云音频转写模型快照日期无效") from None
+            if urlsplit(self.base_url).scheme != "https" or urlsplit(self.base_url).path.rstrip("/") != "/api/v1":
+                raise ValueError("阿里云音频转写 Base URL 需为 HTTPS 并以 /api/v1 结尾，不包含具体操作路径或 compatible-mode")
         if self.kind == "image" and self.protocol == "anthropic":
             raise ValueError("Anthropic Messages 不提供图片生成功能")
-        if self.kind == "transcription" and self.protocol != "openai":
-            raise ValueError("语音转写目前支持 OpenAI 兼容音频转写接口")
+        if self.kind == "transcription" and self.protocol not in {"openai", "dashscope_asr"}:
+            raise ValueError("语音转写请选择 OpenAI 兼容或阿里云音频转写协议")
         return self
+
+class WorkspaceInput(BaseModel):
+    model_config = {"extra": "forbid"}
+    share_projects: bool = Field(strict=True)
+
+class TranscriptionResolveInput(BaseModel):
+    model_config = {"extra": "forbid"}
+    remote_id: str = Field(strict=True, pattern=r"^[A-Za-z0-9_-]{1,200}$")
 
 class StorageInput(BaseModel):
     enabled: bool = False

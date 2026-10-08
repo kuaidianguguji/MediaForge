@@ -6,3 +6,6 @@ __pycache__/
 data/
 backups/
 test-results/
+.integrations/
+integrations/hypit/node_modules/
+integrations/hypit/.hypit/

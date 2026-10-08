@@ -14,6 +14,9 @@ from app.schemas import Options
 from app.security import encrypt, hash_password
 from app.storage import add_asset
 
+REAL_CREATE_VIDEO = providers.create_video
+REAL_GET_VIDEO = providers.get_video
+
 
 @pytest.fixture
 def workflow(db_session, tmp_path, monkeypatch):
@@ -356,3 +359,79 @@ def test_optional_photo_edit_saves_result_before_checker_failure(workflow, monke
     candidate=db.get(Asset,original.meta['optimization_asset_id'])
     assert candidate.data and candidate.meta['qa']['matches'] is False
     assert candidate.role=='rejected_product'
+
+
+def test_wan_native_generation_resume_download_and_real_ffmpeg_join(workflow, monkeypatch):
+    import json
+    import httpx
+    db, project, _, _, _, tmp_path = workflow
+    model = db.get(ModelConfig, project.video_model_id)
+    model.protocol, model.model_id, model.base_url = 'dashscope', 'wan3.0-video', 'https://workspace.cn-beijing.maas.aliyuncs.com/api/v1'
+    project.options = {**project.options, 'replicate_music': False, 'replicate_voice': False}
+    db.commit()
+    job, project = run(db, project, 'analyze')
+    assert job.status == 'succeeded', job.error
+    requests = []
+    query_failed = False
+    submitted = 0
+    def handler(request):
+        nonlocal query_failed, submitted
+        requests.append(request)
+        if request.method == 'POST':
+            submitted += 1
+            assert request.url.path == '/api/v1/services/aigc/video-generation/video-synthesis'
+            body = json.loads(request.content)
+            assert body['parameters']['duration'] == 8 and body['parameters']['audio'] is False
+            assert body['parameters']['resolution'] == '480P'
+            assert body['input']['media'][-1]['type'] == 'reference_video'
+            assert 'Brazilian Portuguese' in body['input']['prompt']
+            return httpx.Response(200, json={'output': {'task_id': f'wan-task-{submitted}', 'task_status': 'PENDING'}})
+        assert request.url.path.startswith('/api/v1/tasks/')
+        if not query_failed:
+            query_failed = True
+            return httpx.Response(503, json={'message': 'temporary query error'})
+        return httpx.Response(200, json={'output': {'task_id': request.url.path.rsplit('/',1)[1], 'task_status': 'SUCCEEDED', 'video_url': 'https://example.com/output.mp4'}})
+    monkeypatch.setattr(providers, '_client', lambda timeout=180: httpx.Client(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(providers, 'create_video', REAL_CREATE_VIDEO)
+    monkeypatch.setattr(providers, 'get_video', REAL_GET_VIDEO)
+    job, project = run(db, project, 'generate')
+    assert job.status == 'failed'
+    record = db.scalar(select(Segment).where(Segment.project_id == project.id, Segment.index == 0))
+    assert record.remote_id == 'wan-task-1' and record.attempts == 1 and submitted == 1
+    job, project = run(db, project, 'generate')
+    assert job.status == 'succeeded', job.error
+    assert project.status == 'completed' and submitted == 2
+    assert [str(r.url).rsplit('/',1)[1] for r in requests if r.method == 'GET'] == ['wan-task-1','wan-task-1','wan-task-2']
+    result = tmp_path / 'wan-result.mp4'
+    result.write_bytes(db.get(Asset, project.output_asset_id).data)
+    assert abs(media.probe(result)['duration'] - 16) < .1
+    assert not media.probe(result)['has_audio']
+
+
+def test_wan_preflight_does_not_consume_attempt_for_oversized_prompt(workflow):
+    db, project, _, submit, _, _ = workflow
+    model = db.get(ModelConfig, project.video_model_id)
+    model.protocol, model.model_id, model.base_url = 'dashscope', 'wan3.0-video', 'https://workspace.cn-beijing.maas.aliyuncs.com/api/v1'
+    db.commit()
+    _, project = run(db, project, 'analyze')
+    plan = copy.deepcopy(project.analysis)
+    plan['product_identity'] = 'x' * 16000
+    plan['segments'][0]['prompt'] = 'y' * 12000
+    project.analysis = plan
+    db.commit()
+    job, project = run(db, project, 'generate')
+    assert job.status == 'failed' and '20000' in job.error
+    record = db.scalar(select(Segment).where(Segment.project_id == project.id, Segment.index == 0))
+    assert record.attempts == 0 and record.remote_id is None and record.status == 'pending'
+    submit.assert_not_called()
+
+
+def test_wan_reference_limit_retimes_whole_interval_instead_of_dropping_tail(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    mapped = Mock(return_value=tmp_path / 'ref.mp4')
+    cut = Mock()
+    monkeypatch.setattr(media, 'cut_mapped_reference', mapped)
+    monkeypatch.setattr(media, 'cut_reference', cut)
+    pipeline.reference_clip(tmp_path / 'source.mp4', 15, 15, SimpleNamespace(start=0,duration=15), tmp_path / 'ref.mp4', max_input_duration=14.9)
+    assert mapped.call_args.args[3] == 15 and mapped.call_args.args[4] == 14.9
+    cut.assert_not_called()

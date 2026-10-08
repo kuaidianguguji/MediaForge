@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, select
@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from . import analysis_results, config, media
 from .db import Asset, Audit, Job, ModelConfig, Project, Segment, SessionLocal, SessionToken, Setting, User, get_db
-from .schemas import AnalysisPlan, AudioOptionsInput, LoginInput, ModelInput, PlanInput, ProjectInput, SegmentRepairInput, SetupInput, StorageInput, UserInput, UserPatch
+from .schemas import AnalysisPlan, AudioOptionsInput, LoginInput, ModelInput, PlanInput, ProjectInput, SegmentRepairInput, SetupInput, StorageInput, TranscriptionResolveInput, UserInput, UserPatch, WorkspaceInput
 from .security import admin_user, current_user, encrypt, hash_password, local_secret, token_hash, verify_password
 from .storage import add_asset, asset_json, storage_settings
 
@@ -52,10 +52,19 @@ async def lifespan(app):
                 log.warning("首次管理员初始化口令（仅本机保存）：%s", token)
         worker = Worker()
         app.state.worker = worker
+        word_worker = None
+        if word_router is not None:
+            from .plugins.word_recreate.pipeline import WordWorker
+            word_worker = WordWorker()
+        app.state.word_worker = word_worker
         if os.environ.get("VIO_DISABLE_WORKER") != "1":
             worker.start()
+            if word_worker:
+                word_worker.start()
         yield
         worker.stop()
+        if word_worker:
+            word_worker.stop()
     finally:
         lock.release()
 
@@ -101,8 +110,29 @@ def owned_project(db, project_id, user):
         raise HTTPException(404, "项目不存在")
     return project
 
-def project_json(db, project, detail=False):
+def native_project(db, project_id, user):
+    project = owned_project(db, project_id, user)
+    if (project.options or {}).get("engine") == "hypit":
+        raise HTTPException(409, "请通过词-复刻视频入口操作该项目")
+    return project
+
+def workspace_settings(db):
+    row = db.get(Setting, "workspace")
+    # Only an explicit administrator opt-in opens the shared workspace.
+    return {"share_projects": bool(row and (row.value or {}).get("share_projects") is True)}
+
+def readable_project(db, project_id, user):
+    project = db.get(Project, project_id)
+    if not project or not (project.owner_id == user.id or user.role == "admin" or workspace_settings(db)["share_projects"]):
+        raise HTTPException(404, "项目不存在")
+    return project
+
+def project_json(db, project, detail=False, *, user, owner_username=None):
     result = {k: getattr(project, k) for k in ["id", "name", "product_description", "status", "options", "created_at", "error", "output_asset_id", "vision_model_id", "video_model_id", "image_model_id", "transcription_model_id"]}
+    if owner_username is None:
+        owner_username = db.scalar(select(User.username).where(User.id == project.owner_id))
+    result.update(owner_id=project.owner_id, owner_username=owner_username or "", can_edit=project.owner_id == user.id or user.role == "admin",
+                  engine="hypit" if (project.options or {}).get("engine") == "hypit" else "native")
     if detail:
         result["analysis"] = project.analysis
         result["assets"] = [asset_json(a) for a in db.scalars(select(Asset).where(Asset.project_id == project.id).order_by(Asset.created_at))]
@@ -175,7 +205,8 @@ def health(user: User = Depends(current_user)):
         ok = True
     except Exception:
         ok = False
-    return {"ffmpeg": ok, "database": "SQLite" if config.DATABASE_URL.startswith("sqlite") else "SQL", "version": "0.1.0"}
+    return {"ffmpeg": ok, "database": "SQLite" if config.DATABASE_URL.startswith("sqlite") else "SQL", "version": "0.1.0",
+            "model_deletion": True}
 
 @app.get("/api/users")
 def users(user: User = Depends(admin_user), db: Session = Depends(get_db)):
@@ -235,30 +266,50 @@ def save_model(db, model, body, user):
 
 @app.post("/api/models", status_code=201)
 def create_model(body: ModelInput, user: User = Depends(admin_user), db: Session = Depends(get_db)):
-    return save_model(db, ModelConfig(), body, user)
+    with mutation_lock:
+        return save_model(db, ModelConfig(), body, user)
+
+def model_project_references(model_id):
+    return ((Project.video_model_id == model_id) | (Project.vision_model_id == model_id)
+            | (Project.image_model_id == model_id) | (Project.transcription_model_id == model_id))
 
 @app.put("/api/models/{model_id}")
 def update_model(model_id: str, body: ModelInput, user: User = Depends(admin_user), db: Session = Depends(get_db)):
-    model = db.get(ModelConfig, model_id)
-    if not model:
-        raise HTTPException(404, "模型不存在")
-    if db.scalar(select(Job.id).join(Project, Project.id == Job.project_id).where(Job.status.in_(["queued", "running"]),
-        (Project.video_model_id == model_id) | (Project.vision_model_id == model_id) | (Project.image_model_id == model_id) | (Project.transcription_model_id == model_id))):
-        raise HTTPException(409, "该模型有任务正在使用，完成或取消后再修改")
-    # A recorded remote task must always be polled against the original endpoint/model.
-    if (model.base_url != body.base_url or model.model_id != body.model_id or model.protocol != body.protocol or model.kind != body.kind) and db.scalar(select(Project.id).where((Project.video_model_id == model_id) | (Project.vision_model_id == model_id) | (Project.image_model_id == model_id) | (Project.transcription_model_id == model_id))):
-        raise HTTPException(409, "模型已被项目引用，修改协议、地址、用途或模型 ID 请新增配置")
-    return save_model(db, model, body, user)
+    with mutation_lock:
+        model = db.get(ModelConfig, model_id)
+        if not model:
+            raise HTTPException(404, "模型不存在")
+        references = model_project_references(model_id)
+        if db.scalar(select(Job.id).join(Project, Project.id == Job.project_id).where(Job.status.in_(["queued", "running"]), references)):
+            raise HTTPException(409, "该模型有任务正在使用，完成或取消后再修改")
+        # A recorded remote task must always be polled against the original endpoint/model.
+        if (model.base_url != body.base_url or model.model_id != body.model_id or model.protocol != body.protocol or model.kind != body.kind) and db.scalar(select(Project.id).where(references)):
+            raise HTTPException(409, "模型已被项目引用，修改协议、地址、用途或模型 ID 请新增配置")
+        return save_model(db, model, body, user)
 
 @app.delete("/api/models/{model_id}")
-def disable_model(model_id: str, user: User = Depends(admin_user), db: Session = Depends(get_db)):
-    model = db.get(ModelConfig, model_id)
-    if not model:
-        raise HTTPException(404, "模型不存在")
-    model.enabled = False
-    audit(db, user, "disable_model", model.id)
-    db.commit()
-    return {"ok": True}
+def delete_model(model_id: str, user: User = Depends(admin_user), db: Session = Depends(get_db)):
+    with mutation_lock:
+        model = db.get(ModelConfig, model_id)
+        if not model:
+            raise HTTPException(404, "模型不存在")
+        references = model_project_references(model_id)
+        if db.scalar(select(Job.id).join(Project, Project.id == Job.project_id)
+                     .where(Job.status.in_(["queued", "running"]), references)):
+            raise HTTPException(409, "该模型有任务正在使用，不能删除。")
+        reference_count = db.scalar(select(func.count()).select_from(Project).where(references))
+        if reference_count:
+            raise HTTPException(409, f"该模型已被 {reference_count} 个项目引用，不能删除；停用请关闭“启用模型”开关。")
+        audit(db, user, "delete_model", model.id)
+        db.delete(model)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Foreign keys also protect references created by another database
+            # writer outside this single-process application's mutation lock.
+            db.rollback()
+            raise HTTPException(409, "该模型已被项目引用，不能删除；停用请关闭“启用模型”开关。") from None
+        return {"ok": True}
 
 @app.get("/api/settings/storage")
 def read_storage(user: User = Depends(admin_user), db: Session = Depends(get_db)):
@@ -280,31 +331,58 @@ def save_storage(body: StorageInput, user: User = Depends(admin_user), db: Sessi
     db.commit()
     return read_storage(user, db)
 
+@app.get("/api/settings/workspace")
+def read_workspace(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    return workspace_settings(db)
+
+@app.put("/api/settings/workspace")
+def save_workspace(body: WorkspaceInput, user: User = Depends(admin_user), db: Session = Depends(get_db)):
+    with mutation_lock:
+        row = db.get(Setting, "workspace") or Setting(key="workspace", value={})
+        row.value = body.model_dump()
+        db.add(row)
+        audit(db, user, "save_workspace")
+        db.commit()
+        return workspace_settings(db)
+
 @app.get("/api/projects")
-def projects(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    # Even administrators see their own dashboard; explicit detail access is allowed for support.
-    return [project_json(db, p) for p in db.scalars(select(Project).where(Project.owner_id == user.id).order_by(Project.created_at.desc()).limit(200))]
+def projects(mine: bool = False, limit: int = Query(default=200, ge=1, le=500), offset: int = Query(default=0, ge=0),
+             user: User = Depends(current_user), db: Session = Depends(get_db)):
+    query = select(Project, User.username).join(User, User.id == Project.owner_id)
+    # With sharing disabled, administrators retain explicit support access to details,
+    # while the library continues to show only their own projects.
+    if mine or not workspace_settings(db)["share_projects"]:
+        query = query.where(Project.owner_id == user.id)
+    query = query.order_by(Project.created_at.desc(), Project.id.desc()).offset(offset).limit(limit)
+    return [project_json(db, project, user=user, owner_username=username) for project, username in db.execute(query)]
 
 @app.post("/api/projects", status_code=201)
 def create_project(body: ProjectInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    for field, kind in [("vision_model_id", "vision"), ("video_model_id", "video"), ("image_model_id", "image"), ("transcription_model_id", "transcription")]:
-        if getattr(body, field):
-            check_model(db, getattr(body, field), kind)
-    project = Project(owner_id=user.id, **body.model_dump())
-    db.add(project)
-    db.flush()
-    audit(db, user, "create_project", project.id)
-    db.commit()
-    return project_json(db, project, True)
+    # Serialize selecting model references with administrator model deletion.
+    with mutation_lock:
+        for field, kind in [("vision_model_id", "vision"), ("video_model_id", "video"), ("image_model_id", "image"), ("transcription_model_id", "transcription")]:
+            if getattr(body, field):
+                check_model(db, getattr(body, field), kind)
+        project = Project(owner_id=user.id, **body.model_dump())
+        db.add(project)
+        db.flush()
+        audit(db, user, "create_project", project.id)
+        db.commit()
+        return project_json(db, project, True, user=user)
 
 @app.get("/api/projects/{project_id}")
 def project_detail(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return project_json(db, owned_project(db, project_id, user), True)
+    return project_json(db, readable_project(db, project_id, user), True, user=user)
 
 @app.post("/api/projects/{project_id}/assets", status_code=201)
 def upload_asset(project_id: str, role: str = Form(...), file: UploadFile = File(...), user: User = Depends(current_user), db: Session = Depends(get_db)):
     with mutation_lock:
         project = owned_project(db, project_id, user)
+        if (project.options or {}).get("engine") == "hypit":
+            if word_router is None:
+                raise HTTPException(409, "词-复刻视频模块已移除，历史素材仍可下载")
+            from .plugins.word_recreate.api import require_enabled
+            require_enabled(db)
         if role not in {"reference", "product"}:
             raise HTTPException(422, "不支持的素材类型")
         allowed = project.status == "draft" or (role == "product" and project.status in {"ready", "failed", "needs_attention"})
@@ -362,6 +440,14 @@ def queue_job(db, project, action, user, *, commit=True):
         if not {"reference", "product"}.issubset(roles):
             raise HTTPException(422, "请先上传参考视频和至少 1 张产品图")
         check_model(db, project.vision_model_id, "vision")
+        if project.transcription_model_id:
+            asr = check_model(db, project.transcription_model_id, "transcription")
+            if asr.protocol == "dashscope_asr":
+                from .audio_transcription import preflight
+                try:
+                    preflight(db, asr)
+                except (ValueError, RuntimeError) as exc:
+                    raise HTTPException(422, str(exc)) from exc
     elif action == "review":
         check_model(db, project.vision_model_id, "vision")
         planned = (project.analysis or {}).get("segments", [])
@@ -403,7 +489,7 @@ def queue_job(db, project, action, user, *, commit=True):
 @app.post("/api/projects/{project_id}/analyze")
 def analyze_project(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     with mutation_lock:
-        project = owned_project(db, project_id, user)
+        project = native_project(db, project_id, user)
         if project.status not in {"draft", "ready", "failed", "needs_attention"} or db.scalar(select(Segment.id).where(Segment.project_id == project.id)):
             raise HTTPException(409, "当前项目不能重新分析")
         result = queue_job(db, project, "analyze", user, commit=False)
@@ -415,7 +501,7 @@ def analyze_project(project_id: str, user: User = Depends(current_user), db: Ses
 @app.put("/api/projects/{project_id}/plan")
 def save_plan(project_id: str, body: PlanInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     with mutation_lock:
-        project = owned_project(db, project_id, user)
+        project = native_project(db, project_id, user)
         if project.status not in {"ready", "failed", "needs_attention"} or db.scalar(select(Segment.id).where(Segment.project_id == project.id)):
             raise HTTPException(409, "只能在开始视频生成前编辑分镜")
         if db.scalar(select(Job.id).where(Job.project_id == project.id, Job.status.in_(["queued", "running"]))):
@@ -431,12 +517,12 @@ def save_plan(project_id: str, body: PlanInput, user: User = Depends(current_use
         project.analysis = body.analysis.model_dump()
         project.status, project.error = "ready", None
         db.commit()
-        return project_json(db, project, True)
+        return project_json(db, project, True, user=user)
 
 @app.post("/api/projects/{project_id}/generate")
 def generate_project(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     with mutation_lock:
-        project = owned_project(db, project_id, user)
+        project = native_project(db, project_id, user)
         if project.status != "ready":
             raise HTTPException(409, "请先完成并检查分镜")
         return queue_job(db, project, "generate", user)
@@ -444,7 +530,7 @@ def generate_project(project_id: str, user: User = Depends(current_user), db: Se
 @app.patch("/api/projects/{project_id}/audio-options")
 def update_audio_options(project_id: str, body: AudioOptionsInput, user: User = Depends(current_user), db: Session = Depends(get_db)):
     with mutation_lock:
-        project = owned_project(db, project_id, user)
+        project = native_project(db, project_id, user)
         if project.status not in {"draft", "ready", "failed", "needs_attention"}:
             raise HTTPException(409, "请等待当前任务结束后再调整音频")
         if db.scalar(select(Job.id).where(Job.project_id == project.id, Job.status.in_(["queued", "running"]))):
@@ -455,12 +541,12 @@ def update_audio_options(project_id: str, body: AudioOptionsInput, user: User = 
         project.options = {**project.options, **body.model_dump()}
         audit(db, user, "update_audio_options", project.id)
         db.commit()
-        return project_json(db, project, True)
+        return project_json(db, project, True, user=user)
 
 @app.post("/api/projects/{project_id}/retry")
 def retry_project(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     with mutation_lock:
-        project = owned_project(db, project_id, user)
+        project = native_project(db, project_id, user)
         if project.status not in {"failed", "needs_attention"}:
             raise HTTPException(409, "该任务目前不需要重试")
         previous = db.scalar(select(Job).where(Job.project_id == project.id).order_by(Job.created_at.desc()).limit(1))
@@ -470,14 +556,14 @@ def retry_project(project_id: str, user: User = Depends(current_user), db: Sessi
 @app.post("/api/projects/{project_id}/review")
 def review_project(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
     with mutation_lock:
-        project = owned_project(db, project_id, user)
+        project = native_project(db, project_id, user)
         return queue_job(db, project, "review", user)
 
 def repair_target(db, segment_id, user):
     segment = db.get(Segment, segment_id)
     if not segment:
         raise HTTPException(404, "片段不存在")
-    project = owned_project(db, segment.project_id, user)
+    project = native_project(db, segment.project_id, user)
     if db.scalar(select(Job.id).where(Job.project_id == project.id, Job.status.in_(["queued", "running"]))):
         raise HTTPException(409, "请等待当前任务结束后再修改片段")
     if not project.analysis or not any(s.get("index") == segment.index for s in project.analysis.get("segments", [])):
@@ -533,7 +619,7 @@ def save_segment_strategy(segment_id: str, body: SegmentRepairInput, user: User 
         project.error, project.status = None, "needs_attention"
         audit(db, user, "update_segment_strategy", segment.id)
         db.commit()
-        return project_json(db, project, True)
+        return project_json(db, project, True, user=user)
 
 @app.post("/api/projects/{project_id}/cancel")
 def cancel_project(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
@@ -556,11 +642,29 @@ def resolve_segment(segment_id: str, body: dict, user: User = Depends(admin_user
     db.commit()
     return {"ok": True}
 
+@app.post("/api/transcriptions/{asset_id}/resolve")
+def resolve_transcription(asset_id: str, body: TranscriptionResolveInput,
+                          user: User = Depends(admin_user), db: Session = Depends(get_db)):
+    with mutation_lock:
+        receipt = db.get(Asset, asset_id)
+        if (not receipt or receipt.role not in {"asr_raw", "word_asr_raw"}
+                or receipt.meta.get("protocol") != "dashscope_asr"
+                or receipt.meta.get("state") not in {"submitting", "uncertain"}
+                or receipt.meta.get("remote_id")):
+            raise HTTPException(409, "该转写记录没有待核对的提交")
+        owned_project(db, receipt.project_id, user)
+        receipt.meta = {**receipt.meta, "remote_id": body.remote_id, "state": "submitted", "error": None}
+        audit(db, user, "resolve_transcription", receipt.id)
+        db.commit()
+        return {"ok": True}
+
 @app.get("/api/assets/{asset_id}")
 def get_asset(asset_id: str, request: Request, download: bool = False, user: User = Depends(current_user), db: Session = Depends(get_db)):
     asset = db.get(Asset, asset_id)
-    if not asset or (asset.owner_id != user.id and user.role != "admin"):
+    if not asset:
         raise HTTPException(404, "素材不存在")
+    # Project visibility governs every material and output, including range playback.
+    readable_project(db, asset.project_id, user)
     start, end = 0, asset.size - 1
     range_header = request.headers.get("range")
     status = 200
@@ -593,6 +697,16 @@ def get_asset(asset_id: str, request: Request, download: bool = False, user: Use
                 length = min(1024 * 1024, end - offset + 1)
                 yield stream_db.scalar(select(func.substr(Asset.data, offset + 1, length)).where(Asset.id == asset_id))
     return StreamingResponse(chunks(), status_code=status, media_type=asset.mime, headers=headers)
+
+# Removing the optional package leaves core projects and archived media readable.
+try:
+    from .plugins.word_recreate.api import router as word_router
+except ModuleNotFoundError as exc:
+    if exc.name not in {"app.plugins", "app.plugins.word_recreate", "app.plugins.word_recreate.api"}:
+        raise
+    word_router = None
+if word_router is not None:
+    app.include_router(word_router)
 
 app.mount("/static", StaticFiles(directory=config.ROOT / "app" / "static"), name="static")
 

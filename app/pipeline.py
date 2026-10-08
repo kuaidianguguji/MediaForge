@@ -99,7 +99,7 @@ def optimize_product(db, project, vision, original, prompt, plan):
         db.commit()
         plan["risks"].append("主图优化未完成或请求结果未知，本次保留原图；系统不会自动重复修图。")
 
-def analyze_project(db, project, job, work, stop_event):
+def analyze_project(db, project, job, work, stop_event, *, transcription_handler=None):
     checkpoint(db, job, "规范化产品图、检测参考视频", 5, stop_event)
     reference = assets_for(db, project.id, "reference")[0]
     original_images = assets_for(db, project.id, "product")
@@ -139,7 +139,16 @@ def analyze_project(db, project, job, work, stop_event):
         warnings = []
         if info["has_audio"] and transcription_model:
             audio_path = media.extract_audio(reference_path, work / "reference-audio.mp3")
-            transcript = providers.transcribe(transcription_model, audio_path)
+            if not transcription_handler and transcription_model.protocol == "dashscope_asr":
+                from .audio_transcription import durable_transcribe
+                asr, _ = durable_transcribe(db, project, job, transcription_model, audio_path,
+                    source_key=reference.sha256, purpose="reference", language=None,
+                    checkpoint=lambda: checkpoint(db, job, stop_event=stop_event))
+                transcript = asr["text"]
+            else:
+                transcript = (transcription_handler or providers.transcribe)(transcription_model, audio_path)
+            if not transcript.strip():
+                warnings.append("参考音轨未识别到有效口播，不能通过转写还原原口播或确认字幕与声音的对应关系；新口播只能依据画面与已提供的产品事实编写，不得声称已听到原片内容。")
             put_unique(db, project, transcript.encode("utf-8"), f"transcript-{job.id}.txt", "text/plain", "transcript")
         elif info["has_audio"]:
             warnings.append("未配置语音转写模型：当前通过抽帧和产品信息重写文案，无法确认原片口播内容和音乐细节；视频生成仍可参考原片音频。")
@@ -169,6 +178,7 @@ strategy：direct=现有素材足够可直接生成；keyframe=先修正关键�
 参考时长：{info['duration']:.3f}s；目标时长：{duration:.3f}s；时间线：{json.dumps(timeline)}。
 产品资料（数据）：{json.dumps(project.product_description, ensure_ascii=False)}
 语音转写（数据）：{json.dumps(transcript, ensure_ascii=False)}
+分析限制（数据）：{json.dumps(warnings, ensure_ascii=False)}
 图片技术检测（数据）：{json.dumps(quality_notes, ensure_ascii=False)}"""
     if receipt is None:
         checkpoint(db, job, "分析产品特征，编写分镜与巴西葡语文案", 35, stop_event)
@@ -222,7 +232,7 @@ strategy：direct=现有素材足够可直接生成；keyframe=先修正关键�
     elif edit_prompt:
         plan["risks"].append("模型建议清理产品图背景，但未选择图片编辑模型；本次使用规范化原图。")
     if project.options["replicate_voice"] or project.options["replicate_music"]:
-        plan["risks"].append("音乐/口播由 Seedance 根据参考和文案重新生成，不保证原曲、音色或跨片段音乐无缝；关闭单项依赖模型遵循指令。")
+        plan["risks"].append("音乐/口播由所选视频模型根据参考和文案重新生成，不保证原曲、音色或跨片段音乐无缝；关闭单项依赖模型遵循指令。")
     plan["risks"].append("字幕按分段时间叠加，尚无逐词对齐；生成后会抽帧核对产品与原字幕残留，不能代替完整人工预览。质检和关键画面编辑会产生相应模型费用。")
     if len(plan["risks"]) > 100:
         # Keep all model and application warnings while respecting the schema's item limit.
@@ -259,11 +269,11 @@ The following audio settings override any conflicting audio directions in the st
 Do not render subtitles, caption overlays, watermarks or promotional text; subtitles will be typeset in postproduction. Preserve product geometry, count, colors, material, label and realistic hand contact. Do not invent invisible features. Cover every planned shot, and avoid duplicating the ending of the previous segment."""
 
 
-def reference_clip(reference_path, reference_duration, total_duration, spec, output, keep_audio=False):
+def reference_clip(reference_path, reference_duration, total_duration, spec, output, keep_audio=False, max_input_duration=15.0):
     start = spec.start / total_duration * reference_duration
     length = min(spec.duration / total_duration * reference_duration, reference_duration - start)
-    target = max(2.0, min(15.0, spec.duration))
-    if length > 15 or length < 2 or abs(total_duration - reference_duration) > .1:
+    target = max(2.0, min(max_input_duration, spec.duration))
+    if length > max_input_duration or length < 2 or abs(total_duration - reference_duration) > .1:
         return media.cut_mapped_reference(reference_path, output, start, length, target, keep_audio=keep_audio)
     return media.cut_reference(reference_path, output, start, length, keep_audio=keep_audio)
 
@@ -303,7 +313,7 @@ def prepare_keyframe(db, project, record, spec, products, reference_path, work, 
         raise NeedsAttention("关键画面未通过产品一致性检查，已保存供预览。请调整该片段策略后重试。")
     return asset
 
-def generate_project(db, project, job, work, stop_event):
+def generate_project(db, project, job, work, stop_event, *, finalize=True):
     plan = AnalysisPlan.model_validate(project.analysis)
     options = project.options
     completed_indices = set(db.scalars(select(Segment.index).where(Segment.project_id == project.id, Segment.asset_id.is_not(None))))
@@ -338,7 +348,8 @@ def generate_project(db, project, job, work, stop_event):
         checkpoint(db, job, f"处理片段 {record.index + 1}/{len(segments)}", 5 + int(record.index / len(segments) * 80), stop_event)
         path = work / f"clip-{record.index}.mp4"
         ref_path = reference_clip(reference_path, ref_info["duration"], sum(s.duration for s in plan.segments), spec,
-            work / f"reference-{record.index}.mp4", keep_audio=options.get("reference_audio", True) and (options["replicate_music"] or options["replicate_voice"]))
+            work / f"reference-{record.index}.mp4", keep_audio=options.get("reference_audio", True) and (options["replicate_music"] or options["replicate_voice"]),
+            max_input_duration=14.9 if model.protocol == "dashscope" else 15.0)
         selected_assets = quality.selected_products(product_assets, spec.model_dump())
         if record.asset_id:
             path.write_bytes(db.get(Asset, record.asset_id).data)
@@ -355,6 +366,13 @@ def generate_project(db, project, job, work, stop_event):
             if not record.remote_id:
                 if record.attempts >= 3:
                     raise NeedsAttention("该片段已达到 3 次视频提交上限，请检查素材和策略后新建项目。")
+                if model.protocol == "dashscope" and spec.strategy == "direct":
+                    prepared_info = media.probe(ref_path)
+                    width, height = prepared_info["width"], prepared_info["height"]
+                    if (not 1 <= prepared_info["duration"] <= 15 or not 240 <= min(width, height)
+                            or max(width, height) > 4096 or max(width, height) / min(width, height) > 8
+                            or ref_path.stat().st_size > 100 * 1024 * 1024):
+                        raise ValueError("万相参考片段规格不符合要求：时长 1–15 秒、边长 240–4096 像素、长宽比不超过 8:1、文件不超过 100 MB。请调整参考素材。")
                 keyframe = prepare_keyframe(db, project, record, spec, selected_assets, ref_path, work, job, stop_event) if spec.strategy == "keyframe" else None
                 # Sign immediately before submission; earlier segments may queue for hours.
                 current_urls = []
@@ -370,12 +388,19 @@ def generate_project(db, project, job, work, stop_event):
                     current_urls.append(providers.publish_media(settings, f"vio/{project.id}/continuity-{record.index}.jpg", continuity_path.read_bytes(), "image/jpeg"))
                 # Keyframe/adapt modes omit the old product footage to reduce visual leakage.
                 ref_url = providers.publish_media(settings, f"vio/{project.id}/reference-{record.index}.mp4", ref_path.read_bytes(), "video/mp4") if spec.strategy == "direct" else None
+                prompt = generation_prompt(project, spec.model_dump(), use_continuity)
+                if model.protocol == "dashscope":
+                    prompt = ("万相素材编号：参考图片按输入顺序从图1开始编号；产品图定义目标产品，"
+                              "关键画面或连续性参考只按下文指定用途使用。视频1（如有）仅提供镜头和动作，"
+                              "必须替换其所有原产品和局部部件，不得延长原视频或把参考视频直接当输出。\n" + prompt)
+                    providers.wan_video_payload(model, prompt, current_urls, ref_url, spec.generation_duration,
+                        options["ratio"], options["resolution"], options["replicate_music"] or options["replicate_voice"])
                 checkpoint(db, job, stop_event=stop_event)
                 record.status = "submitting"
                 record.attempts += 1
                 db.commit()
                 try:
-                    record.remote_id = providers.create_video(model, generation_prompt(project, spec.model_dump(), use_continuity), current_urls, ref_url,
+                    record.remote_id = providers.create_video(model, prompt, current_urls, ref_url,
                         spec.generation_duration, options["ratio"], options["resolution"], options["replicate_music"] or options["replicate_voice"])
                 except providers.SubmissionUncertain:
                     raise NeedsAttention("供应商可能已接受视频任务，但没有返回可保存的任务 ID。请管理员到控制台核对后关联，系统不会自动重复提交")
@@ -410,7 +435,7 @@ def generate_project(db, project, job, work, stop_event):
                     raise ValueError(f"片段 {record.index + 1} 生成失败：{record.error}")
                 if time.monotonic() - started > 45 * 60:
                     raise NeedsAttention("生成等待超过 45 分钟；已保留任务 ID，可稍后点击重试继续查询")
-                stop_event.wait(5)
+                stop_event.wait(15 if model.protocol == "dashscope" else 5)
         clip_paths.append(path)
         visible_clip = media.cut_reference(path, work / f"visible-{record.index}.mp4", 0, spec.duration, keep_audio=False)
         if not record.quality or record.quality.get("asset_id") != record.asset_id:
@@ -421,6 +446,9 @@ def generate_project(db, project, job, work, stop_event):
             db.commit()
         # A faulty/unverified product must not propagate into the next generation.
         continuity_path = media.last_frame(visible_clip, work / f"last-{record.index}.jpg") if record.quality.get("status") == "pass" else None
+    if not finalize:
+        checkpoint(db, job, "视频片段已保存，准备交给词-复刻视频合成", 88, stop_event)
+        return {"clips": clip_paths, "plan": plan, "segments": segments}
     checkpoint(db, job, "统一画幅、添加葡语字幕、拼接导出", 90, stop_event)
     subtitles = [{"start": s.start, "end": s.start + s.duration, "text": s.subtitle} for s in plan.segments if s.subtitle] if options["replicate_subtitles"] else None
     output = media.join_clips(clip_paths, work / "output.mp4", durations=[s.duration for s in plan.segments], ratio=options["ratio"], resolution=options["resolution"], subtitles=subtitles, mute=not (options["replicate_music"] or options["replicate_voice"]))
@@ -463,13 +491,15 @@ def review_project(db, project, job, work, stop_event):
     checkpoint(db, job, "抽帧质检完成；未重新生成视频，请检查报告并完整预览", 100, stop_event)
 
 class Worker:
+    actions = ("analyze", "generate", "review")
+
     def __init__(self):
         self.stop_event = threading.Event()
         self.thread = None
 
     def start(self):
         with SessionLocal() as db:
-            for job in db.scalars(select(Job).where(Job.status == "running")):
+            for job in db.scalars(select(Job).where(Job.status == "running", Job.action.in_(self.actions))):
                 job.status, job.error = "needs_attention", "服务在任务期间中断；请重试以恢复，已提交的视频任务会复用 ID"
                 project = db.get(Project, job.project_id)
                 project.status, project.error = "needs_attention", job.error
@@ -486,7 +516,7 @@ class Worker:
         while not self.stop_event.is_set():
             try:
                 with SessionLocal() as db:
-                    job = db.scalar(select(Job).where(Job.status == "queued").order_by(Job.created_at).limit(1))
+                    job = db.scalar(select(Job).where(Job.status == "queued", Job.action.in_(self.actions)).order_by(Job.created_at, Job.id).limit(1))
                     job_id = job.id if job else None
                 if job_id:
                     self.run_job(job_id)
@@ -499,7 +529,14 @@ class Worker:
     def run_job(self, job_id):
         with SessionLocal() as db:
             job = db.get(Job, job_id)
+            if not job or job.action not in self.actions or job.status != "queued":
+                return
             project = db.get(Project, job.project_id)
+            if (project.options or {}).get("engine") == "hypit":
+                job.status, job.error = "needs_attention", "项目引擎与任务入口不匹配，请通过词-复刻视频入口恢复"
+                project.status, project.error = "needs_attention", job.error
+                db.commit()
+                return
             job.status, job.updated_at = "running", time.time()
             db.commit()
             try:

@@ -88,9 +88,11 @@ def _headers(model):
     return {"Authorization": "Bearer " + key}
 
 
-def _request(model, method, path, *, submitting=False, **kwargs):
+def _request(model, method, path, *, submitting=False, extra_headers=None, **kwargs):
     endpoint = _endpoint(model, path)
     headers = _headers(model)
+    if extra_headers:
+        headers.update(extra_headers)
     try:
         with _client(300 if submitting else 180) as client:
             response = client.request(method, endpoint, headers=headers, **kwargs)
@@ -106,7 +108,7 @@ def _request(model, method, path, *, submitting=False, **kwargs):
         advice = {401: "密钥无效", 403: "没有模型访问权限", 404: "接口或模型不存在",
                   413: "输入文件过大", 429: "服务商限流或额度不足"}.get(response.status_code, "请检查模型配置与输入参数")
         try:
-            hint = video_error_hint(response.json())
+            hint = wan_error_hint(response.json()) if model.protocol == "dashscope" else video_error_hint(response.json())
         except ValueError:
             hint = None
         if hint:
@@ -265,6 +267,18 @@ def transcribe(model, audio: Path) -> str:
 
 def create_video(model, prompt: str, image_urls: list[str], video_url: str | None,
                  duration: int, ratio="9:16", resolution="720p", generate_audio=True) -> str:
+    if model.protocol == "dashscope":
+        body = wan_video_payload(model, prompt, image_urls, video_url, duration, ratio, resolution, generate_audio)
+        result = _request(model, "POST", "services/aigc/video-generation/video-synthesis", submitting=True,
+                          extra_headers={"X-DashScope-Async": "enable"}, json=body)
+        output = result.get("output")
+        task_id = output.get("task_id") if isinstance(output, dict) else None
+        if isinstance(task_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,200}", task_id):
+            return task_id
+        hint = wan_error_hint(result)
+        if hint:
+            raise ProviderError(hint)
+        raise SubmissionUncertain("阿里云没有返回有效任务 ID，可能已受理；请先核查百炼任务记录，避免重复扣费。")
     if model.protocol != "volcengine":
         raise ProviderError("Seedance 视频需要火山引擎原生协议；Chat 兼容接口不等于视频接口兼容。")
     if type(duration) is not int or not 4 <= duration <= 15:
@@ -297,10 +311,30 @@ def create_video(model, prompt: str, image_urls: list[str], video_url: str | Non
 
 
 def get_video(model, task_id) -> dict:
-    if model.protocol != "volcengine":
-        raise ProviderError("此模型没有配置火山引擎视频任务协议。")
     if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", task_id):
         raise ProviderError("视频任务 ID 无效。")
+    if model.protocol == "dashscope":
+        result = _request(model, "GET", "tasks/" + quote(task_id, safe=""))
+        output = result.get("output")
+        if not isinstance(output, dict):
+            raise ProviderError(wan_error_hint(result) or "阿里云响应缺少视频任务信息，请核查 Base URL 和模型权限。")
+        returned_id = output.get("task_id")
+        if returned_id is not None and returned_id != task_id:
+            raise ProviderError("阿里云返回的任务 ID 与查询不符，已停止处理。")
+        upstream_status = output.get("task_status")
+        if upstream_status == "UNKNOWN":
+            raise ProviderError("阿里云任务不存在、状态未知或已超过 24 小时查询期限。已保留任务 ID，请在百炼控制台核查，系统不会重新提交。")
+        status = {"PENDING": "queued", "RUNNING": "running", "SUCCEEDED": "succeeded",
+                  "FAILED": "failed", "CANCELED": "cancelled"}.get(upstream_status) if isinstance(upstream_status, str) else None
+        if status is None:
+            raise ProviderError("阿里云返回未知任务状态，已保留任务 ID，请稍后重试查询。")
+        url = output.get("video_url")
+        if status == "succeeded" and (not isinstance(url, str) or not url.startswith("https://")):
+            raise ProviderError("阿里云任务成功但缺少有效下载地址，已保留任务 ID，请核查任务结果。")
+        error = (wan_error_hint(result) or "阿里云视频生成失败，请在百炼控制台核查任务详情。") if status == "failed" else "阿里云视频任务已取消。" if status == "cancelled" else None
+        return {"status": status, "video_url": url if status == "succeeded" else None, "error": error}
+    if model.protocol != "volcengine":
+        raise ProviderError("此模型没有配置受支持的视频任务协议。")
     result = _request(model, "GET", "contents/generations/tasks/" + quote(task_id, safe=""))
     status = result.get("status")
     if status not in {"queued", "running", "succeeded", "failed", "cancelled", "expired"}:
@@ -315,6 +349,56 @@ def get_video(model, task_id) -> dict:
     if status == "failed":
         error = video_error_hint(result) or error
     return {"status": status, "video_url": url, "error": error}
+
+
+WAN_ERROR_HINTS = {
+    "InvalidApiKey": "阿里云 API Key 无效，请确认密钥、业务空间与地域匹配。",
+    "invalid_api_key": "阿里云 API Key 无效，请确认密钥、业务空间与地域匹配。",
+    "InvalidParameter": "万相输入参数或素材规格不符合要求，请检查图片、视频、时长和分辨率。",
+    "Arrearage": "阿里云账户可能欠费，请管理员检查账户状态与余额。",
+    "DataInspectionFailed": "万相输入或输出未通过内容审核，请检查素材和文案。",
+    "data_inspection_failed": "万相输入或输出未通过内容审核，请检查素材和文案。",
+    "AccessDenied": "没有万相模型调用权限，请检查百炼模型授权。",
+    "AccessDenied.Unpurchased": "请先开通阿里云百炼服务并申请模型权限。",
+    "Model.AccessDenied": "没有万相模型调用权限，请检查业务空间的模型授权。",
+    "Workspace.AccessDenied": "没有此百炼业务空间的权限，请检查 Base URL 和 API Key 是否匹配。",
+}
+
+
+def wan_error_hint(result):
+    if not isinstance(result, dict):
+        return None
+    output = result.get("output")
+    code = output.get("code") if isinstance(output, dict) and output.get("code") else result.get("code")
+    if not isinstance(code, str) or code not in WAN_ERROR_HINTS:
+        return None
+    return f"{WAN_ERROR_HINTS[code]} [错误码：{code}]"
+
+
+def wan_video_payload(model, prompt, image_urls, video_url, duration, ratio, resolution, generate_audio):
+    """Validate before recording a submission or charging an attempt; no network."""
+    if model.model_id not in {"wan3.0-video", "wan3.0-video-prime"}:
+        raise ProviderError("阿里云视频接口目前支持 wan3.0-video 与 wan3.0-video-prime。")
+    if urlsplit(model.base_url).path.rstrip("/") != "/api/v1":
+        raise ProviderError("阿里云视频 Base URL 必须以 /api/v1 结尾，不包含具体操作路径。")
+    if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 20000:
+        raise ProviderError("万相视频提示词不能为空且不能超过 20000 字符，请精简该片段分镜与产品约束后再生成。")
+    # Keep the existing <=15s segment/FFmpeg workflow; Wan's 30s mode is not exposed here.
+    if type(duration) is not int or not 4 <= duration <= 15:
+        raise ProviderError("本项目万相每段生成时长为 4–15 秒整数，长视频会自动分段拼接。")
+    if not isinstance(image_urls, list) or not 1 <= len(image_urls) <= 10:
+        raise ProviderError("万相产品复刻需要 1–10 张参考图片。")
+    if ratio not in {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "adaptive"} or resolution not in {"480p", "720p", "1080p"}:
+        raise ProviderError("万相不支持此比例或分辨率，请选择 480P、720P 或 1080P。")
+    for url in image_urls + ([video_url] if video_url else []):
+        if not isinstance(url, str) or not url.startswith("https://"):
+            raise ProviderError("万相参考素材需要可访问的公网 HTTPS 临时链接。")
+    media = [{"type": "reference_image", "url": url} for url in image_urls]
+    if video_url:
+        media.append({"type": "reference_video", "url": video_url})
+    return {"model": model.model_id, "input": {"prompt": prompt, "media": media},
+            "parameters": {"duration": duration, "ratio": ratio, "resolution": resolution.upper(),
+                           "audio": bool(generate_audio), "prompt_extend": False, "watermark": False}}
 
 
 def _public_target(url):

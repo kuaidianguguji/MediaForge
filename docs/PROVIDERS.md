@@ -12,7 +12,9 @@
 | 商品图优化 | OpenAI 兼容图像编辑 | 服务商实际 `/v1` 地址 | `POST /images/edits`，multipart 图片文件 |
 | 商品图优化 | 火山引擎 Seedream | 火山 `/api/v3` 地址 | `POST /images/generations`，`image` Data URI |
 | 原视频语音转写 | OpenAI 兼容转写 | 服务商实际 `/v1` 地址 | `POST /audio/transcriptions`，multipart 音频文件 |
+| 原视频 / 词复刻音频转写 | 阿里云百炼（音频转写） | `https://你的业务空间ID.cn-beijing.maas.aliyuncs.com/api/v1` | `POST /services/audio/asr/transcription`、`GET /tasks/{id}` |
 | Seedance 视频 | 火山引擎原生 | 火山 `/api/v3` 或兼容代理地址 | `POST /contents/generations/tasks`、`GET /contents/generations/tasks/{id}` |
+| 万相 3.0 视频 | 阿里云百炼 | `https://你的业务空间ID.cn-beijing.maas.aliyuncs.com/api/v1` | `POST /services/aigc/video-generation/video-synthesis`、`GET /tasks/{id}` |
 
 Base URL 需要包含版本路径，不能直接填写某个完整接口路径。允许管理员配置内网 HTTP/HTTPS 代理；接口不跟随重定向，以免转发凭据。公网服务应使用 HTTPS。
 
@@ -79,6 +81,42 @@ Content-Type: application/json
 查询成功返回 `content.video_url`；链接有效期为 24 小时，任务只能查询近 7 天记录，必须及时下载并归档为数据库资产。保存任务 ID 后轮询，不能重新创建任务当作查询。`queued`、`running` 继续查询；`succeeded` 下载；`failed`、`cancelled`、`expired` 终止。局域网服务器无需提供公网回调地址。[查询任务 API](https://docs.volcengine.com/docs/ark/get-video-generation-task-api?lang=zh)
 
 产品替换能以该输入组合实现，但精确商品形状、包装文字、手部互动、口播发音和跨片段一致性仍需要质检。保留参考视频的镜头结构不保证逐帧等同。火山另有独立 LAS 视频编辑算子，官方列出 `object_replace` 用途；它有独立鉴权和计费接口，当前未混入 Ark 适配器。[LAS 视频编辑增强版](https://docs.volcengine.com/docs/Lake%20AI%20Service/2499936?lang=en)
+
+## 万相 3.0（新增于 2026-10-07）
+
+在设置中心新增或编辑配置：用途选择 **视频生成**，协议选择 **阿里云百炼（万相视频）**，模型 ID 填写 `wan3.0-video` 或 `wan3.0-video-prime`。Base URL 填写控制台对应业务空间、地域的 `/api/v1` 基础地址，不包含视频操作路径或 `/compatible-mode/v1`。API Key 必须匹配该地域和业务空间，并已获得模型调用权限。阿里云百炼（万相视频）协议仅适配万相视频，音频转写使用独立协议，图片优化或视觉分析选择其对应协议。
+
+适配器使用 `Authorization: Bearer ...` 与 `X-DashScope-Async: enable` 提交原生异步任务，将 `output.task_id` 持久化，之后每约 15 秒查询该任务。产品图片映射为 `input.media[].type=reference_image`；直接生成策略还输入 `reference_video`，关键画面/改编策略仅输入参考图片，不混用首尾帧类型。分辨率转换为 `480P/720P/1080P`，`audio` 对应音乐/口播任意一项开启，`watermark=false`；关闭 `prompt_extend` 以避免供应商再次改写已确认的产品约束和镜头脚本。
+
+虽然模型支持最多 30 秒输出，本项目继续使用每段 **4–15 秒** 的通用时间线，长视频由 FFmpeg 拼接。参考片段最长使用 14.9 秒，给编码与音轨时长留出缓冲；完整源区间通过轻微变速映射，不删掉最后镜头。万相参考视频总时长加输出时长不得超过 30 秒。提交前检查参考片段的时长、边长、比例与 100 MB 大小限制；超过 20000 字符的提示词停止并提示精简，不截掉产品约束，也不消耗视频提交次数。
+
+继续使用已配置的 TOS 公网 HTTPS 临时链接作为输入，阿里云接口支持此类 URL，无须另外配置 OSS。万相任务状态 `PENDING/RUNNING/SUCCEEDED/FAILED/CANCELED` 转换为项目已有状态，成功后立即下载并存入数据库，复用产品质检和 FFmpeg 合成。任务与下载链接仅保留约 24 小时；`UNKNOWN`、损坏查询或缺少下载地址时保留原任务 ID，不把状态未知当成确定失败重新提交。网络异常或提交成功但 ID 缺失时，沿用管理员核查并关联任务的流程。
+
+本次验证使用模拟 HTTP 服务与真实本地 FFmpeg，未调用真实计费生成。实际商品替换、巴西葡语口播和跨片段连续性需用你的样片验收。[万相 3.0 官方 API](https://help.aliyun.com/zh/model-studio/wan3-video-generation-api-reference)、[阿里云错误码](https://help.aliyun.com/zh/model-studio/error-code)。
+
+## 阿里云音频转写
+
+核对日期：2026-10-07。设置中心新增模型时填写：
+
+| 配置项 | 填写内容 |
+| --- | --- |
+| 模型用途 | **音频转写** |
+| 接口协议 | **阿里云百炼（音频转写）**，内部标识 `dashscope_asr` |
+| 模型 ID | `qwen3-asr-flash-filetrans`，或控制台已开通的日期版本，例如 `qwen3-asr-flash-filetrans-2025-11-17` |
+| API Base URL | 控制台对应地域的 `/api/v1` 地址，例如 `https://你的业务空间ID.cn-beijing.maas.aliyuncs.com/api/v1` |
+| API Key | 与模型、基础地址同地域的百炼密钥 |
+
+北京也可使用 `https://dashscope.aliyuncs.com/api/v1`；新加坡使用控制台对应的业务空间地址或 `https://dashscope-intl.aliyuncs.com/api/v1`。不要填 `compatible-mode/v1`，也不要填完整的 `.../services/audio/asr/transcription` 操作路径。该模型使用专用异步接口，和万相视频协议分别配置。`qwen3-asr-flash` 的聊天兼容调用不能代替这里的文件转写与词时间戳。[阿里云 Qwen-ASR API](https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference)、[支持模型与地域](https://help.aliyun.com/zh/model-studio/non-realtime-speech-recognition-user-guide)。
+
+管理员须先启用现有 TOS，使用阿里云转写期间保持配置有效并启用。当前创建、分析、生成入口会检查 TOS；已有任务重试继续查询，但任务入口仍要求有效的 TOS 配置。服务端提取音频，保存到项目数据库，再向私有桶上传用于模型读取的临时副本并生成签名 HTTPS 链接，无须另建 OSS。接口使用 `X-DashScope-Async: enable` 提交、保存任务 ID 后查询；转写原始结果和词时间信息入库。转写会产生模型费用，已确认的任务在重试时继续查询，不自动重复提交。原片转写自动识别语言，词复刻生成后的巴西站点口播按葡萄牙语识别。
+
+提交状态不确定且没有任务 ID 时，先在百炼控制台核查同一音频与提交时间，再由管理员在项目的 **模型任务 → 关联转写任务 ID** 保存核对结果；该操作不调用收费模型。随后点击项目 **重试任务** 继续查询。已知 ID 即使查询失败也保留，不因无法查询再次提交。
+
+该配置可供原有视频复刻分析口播，也可供词复刻识别生成视频中的实际巴西葡语口播。词复刻请求词级时间戳，再用于字幕高亮和对齐；识别错误与时间偏差仍需人工试听确认。接口适配测试不调用真实计费模型。
+
+百炼返回 `SUCCESS_WITH_NO_VALID_FRAGMENT` 时，表示本次转写没有识别到有效语音片段，不能据此断言原片一定没有声音。项目会在 **模型任务** 显示 **未识别到口播**、安全的原因提示及已有任务 ID。参考视频遇到该结果仍可继续按产品事实和画面分析并编写新口播，但无法还原原口播；词复刻成片遇到该结果则停止字幕合成，保留已生成片段，不能编造口播或词时间戳。
+
+该结果会缓存。已有失败任务点击 **重试任务** 时只查询保存的任务 ID 以取得明确结果，不重新提交音频；已缓存的无有效口播结果直接复用。参考视频继续分析可能按正常流程产生视觉分析费用，不会因为上述错误自动重交转写或重做视频。
 
 ## 私有 TOS 存储桶
 

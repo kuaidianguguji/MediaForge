@@ -18,7 +18,7 @@ def add_asset(db, project, data, name, mime, role, meta=None):
 def storage_settings(db):
     row = db.get(Setting, "storage")
     if not row or not row.value.get("enabled"):
-        raise ValueError("请管理员先配置并启用火山 TOS，用于向 Seedance 提供可访问的参考素材")
+        raise ValueError("请管理员先配置并启用火山 TOS，用于向视频模型提供可访问的参考素材")
     settings = dict(row.value)
     settings["secret_access_key"] = decrypt(settings.pop("secret_cipher", ""))
     if not settings["secret_access_key"]:
